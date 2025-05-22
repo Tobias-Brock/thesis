@@ -2,7 +2,7 @@
 # GLOBALS                                                                       #
 #################################################################################
 
-PROJECT_NAME = periodontal-modeling
+PROJECT_NAME = thesis
 PYTHON_VERSION = 3.11
 PYTHON_INTERPRETER = python
 
@@ -26,7 +26,7 @@ clean:
 ## Format source code with black
 .PHONY: black
 black:
-	black --config pyproject.toml periomod
+	black --config pyproject.toml sltns
 
 ## Format source code with ruff
 .PHONY: ruff
@@ -69,17 +69,3 @@ preprocess:
 .PHONY: benchmark
 benchmark:
 	$(PYTHON_INTERPRETER) periomod/benchmarking/_benchmark.py ${ARGS}
-
-.PHONY: app
-app:
-	$(PYTHON_INTERPRETER) periomod/app/_app.py
-
-## Build Docker image
-.PHONY: docker-build
-docker-build:
-	docker build -f docker/app.dockerfile -t periomod-image .
-
-## Run Docker container
-.PHONY: docker-run
-docker-run:
-	docker run -p 7890:7890 periomod-image
