@@ -1,187 +1,218 @@
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
-from numpy.typing import NDArray
 
 
-def generate_simulated_data(
-    d: int,
-    ms: List[int],
-    eps1: List[float],
-    eps2: List[float],
-    rng: np.random.Generator,
-    alpha: float = 0.5,
-    sigma: float = 0.1,
-    random_w: bool = False,
-    normalize_w_t: bool = True,
-    feature_means: Optional[List[float]] = None,
-    beta_mixing: bool = False,
-    beta_value: float = 0.0,
-    weight_loc: float = 0.0,
-    noise_loc: float = 0.0,
-) -> Tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    List[NDArray[np.float64]],
-    List[NDArray[np.float64]],
-]:
-    """Simulation setup.
+class TimeSeriesSimulator:
+    """Time series simulator for multiple processes.
 
-    Data simulation for D_1..D_{T+1} Gaussian distributions, with optional:
-      - Different feature means,
-      - Simple AR(1)-like beta mixing across time steps,
-      - Mean shift for weight vectors,
-      - Mean shift for label noise.
+    Generate, step through, and record values of various time series:
+      - white_noise, random_walk, AR(1), unit_root, periodic, heteroskedastic.
+    """
+
+    configs: List[Dict[str, Any]]
+    n: int
+    rng: np.random.Generator
+    t: int
+    states: List[float]
+    phases: List[float]
+    variances: Dict[int, float]
+    history: List[List[float]]
+
+    def __init__(
+        self,
+        configs: list,
+        n: int = 200,
+        seed: int = 42,
+    ):
+        """Initialize the simulator and its state.
+
+        Args:
+            configs (list): Each dict may include:
+                - kind (str): "white_noise", "random_walk", "ar1",
+                  "unit_root", "periodic", "heteroskedastic".
+                - sigma (float): Std of noise (default 1.0).
+                - phi (float): AR(1) coefficient (default 0.7).
+                - omega (float): Frequency for periodic (default 1.0).
+                - phase (bool): Random phase if True (default True).
+            n (int): Number of time steps to simulate.
+            seed (int): Random seed for reproducibility.
+        """
+        self.configs = configs
+        self.n = n
+        self.rng = np.random.default_rng(seed)
+        # time index
+        self.t = 0
+        # history of outputs per process
+        self.history = [[] for _ in configs]
+        # internal state for stateful processes
+        self.states = [0.0] * len(configs)  # List[float]
+        # random initial phase for periodic
+        self.phases = [0.0] * len(configs)
+        self._init_states()
+
+    def _init_states(self) -> None:
+        """Initialize states and phases for each process."""
+        for i, cfg in enumerate(self.configs):
+            kind = cfg.get("kind", "white_noise")
+            sigma = cfg.get("sigma", 1.0)
+            phi = cfg.get("phi", 0.7)
+            if kind in ("random_walk", "unit_root", "ar1"):
+                # draw initial noise for stateful processes
+                eps0 = self.rng.normal(0, sigma)
+                if kind == "ar1":
+                    self.states[i] = eps0
+                else:
+                    self.states[i] = eps0
+            if kind == "periodic":
+                phase_flag = cfg.get("phase", True)
+                self.phases[i] = self.rng.uniform(0, 2 * np.pi) if phase_flag else 0.0
+            if kind == "arch":
+                # start with unconditional var = sigma^2
+                self.states[i] = 0.0  # last ε_t
+                self.variances = getattr(self, "variances", {})
+                self.variances[i] = sigma**2  # last σ²_t
+            if kind == "garch":
+                # same: track last residual and variance
+                self.states[i] = 0.0
+                self.variances = getattr(self, "variances", {})
+                self.variances[i] = sigma**2
+            if kind == "tv_ar1":
+                # state holds last residual x_{t-1}
+                self.states[i] = 0.0
+
+    def step(self) -> list[float]:
+        """Advance one time step, generate and record values for all processes.
+
+        Returns:
+            list[float]: Values at the current time for each process.
+        """
+        values: list[float] = []
+        for i, cfg in enumerate(self.configs):
+            kind = cfg.get("kind", "white_noise")
+            sigma = float(cfg.get("sigma", 1.0))
+            phi = float(cfg.get("phi", 0.7))
+
+            if kind == "white_noise":
+                y = self.rng.normal(0, sigma)
+
+            elif kind == "random_walk":
+                eps = self.rng.normal(0, sigma)
+                y = self.states[i] + eps
+                self.states[i] = y
+
+            elif kind == "ar1":
+                eps = self.rng.normal(0, sigma)
+                y = phi * self.states[i] + eps
+                self.states[i] = y
+
+            elif kind == "periodic":
+                omega = float(cfg.get("omega", 1.0))
+                t = self.t
+                phase0 = self.phases[i]
+                y = np.cos(omega * t + phase0)
+
+            elif kind == "heteroskedastic":
+                t = self.t + 1
+                eps = self.rng.normal(0, 1)
+                y = sigma * np.sqrt(t) * eps
+
+            elif kind == "arch":
+                ω = float(cfg.get("omega", 0.1 * sigma**2))
+                α = float(cfg.get("alpha", 0.8))
+                ε_prev = self.states[i]
+                σ2_prev = self.variances[i]
+                σ2_t = ω + α * (ε_prev**2)
+                ε_t = self.rng.normal(0, np.sqrt(σ2_t))
+                y = ε_t
+                self.states[i] = ε_t
+                self.variances[i] = σ2_t
+
+            elif kind == "garch":
+                ω = float(cfg.get("omega", 0.1 * sigma**2))
+                α = float(cfg.get("alpha", 0.1))
+                β = float(cfg.get("beta", 0.8))
+                ε_prev = self.states[i]
+                σ2_prev = self.variances[i]
+                σ2_t = ω + α * (ε_prev**2) + β * σ2_prev
+                ε_t = self.rng.normal(0, np.sqrt(σ2_t))
+                y = ε_t
+                self.states[i] = ε_t
+                self.variances[i] = σ2_t
+
+            elif kind == "tv_ar1":
+                # user must supply two callables in cfg:
+                phi_trend: Callable[[float], float] = cfg["phi_trend"]
+                mu_trend: Callable[[int], float] = cfg["mu_trend"]
+                φ_t = phi_trend(self.t / self.n)
+                μ_t = mu_trend(self.t)
+                x_prev = self.states[i]
+                eps = self.rng.normal(0, sigma)
+                x_t = φ_t * x_prev + eps
+                y = μ_t + x_t
+                self.states[i] = x_t
+
+            else:
+                raise ValueError(f"Unknown kind: {kind!r}")
+
+            self.history[i].append(y)
+            values.append(y)
+
+        self.t += 1
+        return values
+
+    def generate(self) -> np.ndarray:
+        """Simulate all n time steps and return array of shape (n, num_processes)."""
+        self.t = 0
+        self.history = [[] for _ in self.configs]
+        self._init_states()
+        output = np.zeros((self.n, len(self.configs)))
+        for ti in range(self.n):
+            vals = self.step()
+            output[ti] = vals
+        return output
+
+    def get_history(self) -> list:
+        """Retrieve the list of recorded values for each process."""
+        return [np.array(hist) for hist in self.history]
+
+
+def split_data(
+    X: np.ndarray,
+    y: np.ndarray,
+    w_val: int,
+    w_test: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split time-series data into train, validation, and test sets.
+
+    Splits:
+      - Train: indices [0, n - w_val - w_test)
+      - Val:   indices [n - w_val - w_test, n - w_test)
+      - Test:  indices [n - w_test, n)
 
     Args:
-      d (int):
-        Dimension of each data point.
-      ms (List[int]):
-        Sample sizes for T+1 distributions (first T are sources, last is target).
-      eps1 (List[float]):
-        Std devs for feature generation of each distribution (length T+1).
-      eps2 (List[float]):
-        Magnitudes for how each source's w differs from the target's w (length T).
-      rng (np.random.Generator):
-        Random generator for reproducibility.
-      alpha (float):
-        Fraction of each D_i replaced by heavy noise from index alpha*m_i onward.
-      sigma (float):
-        Std dev of label noise (but possibly with mean = noise_loc).
-      random_w (bool):
-        If True, re-draw base_w for each source; otherwise reuse one base_w.
-      normalize_w_t (bool):
-        If True, re-normalize w_i after w_i = w_target + eps2[i] * w_base.
-      feature_means (Optional[List[float]]):
-        Per-distribution means for the features (length T+1). Defaults to 0.0 each.
-      beta_mixing (bool):
-        If True, apply AR(1)-like correlation across time steps in the features.
-      beta_value (float):
-        Beta parameter in [0,1) for the AR(1)-like correlation if beta_mixing=True.
-      weight_loc (float):
-        Mean shift for weight-vector draws (both target and base). By default 0.0.
-      noise_loc (float):
-        Mean shift for label noise draws. By default 0.0.
+        X (ndarray): Feature matrix of shape (n, d).
+        y (ndarray): Target array of length n.
+        w_val (int): Number of points to hold out for validation.
+        w_test (int): Number of points to hold out for final test.
 
     Returns:
-      (x_d1T_train, y_d1T_train,
-       x_trgt_train, y_trgt_train,
-       x_trgt_test, y_trgt_test,
-       x_trgt_val, y_trgt_val,
-       x_d1T_list, y_d1T_list)
-
-      - x_d1T_train, y_d1T_train:
-          Flattened source features/labels over T distributions.
-      - x_trgt_train, y_trgt_train:
-          Target train data/labels.
-      - x_trgt_test, y_trgt_test:
-          Target test data/labels.
-      - x_trgt_val, y_trgt_val:
-          Target validation data/labels.
-      - x_d1T_list, y_d1T_list:
-          Per-source-chunk features/labels (lists of arrays),
-          shape (ms[i], d) and (ms[i],1) for each i in [0..T-1].
+        Tuple containing:
+          - X_train, y_train: Training data
+          - X_val,   y_val:   Validation data
+          - X_test,  y_test:  Test data
     """
-    T = len(ms) - 1
-    m1T_sum = np.sum(ms[:T])
+    n = len(y)
+    idx_train_end = n - w_val - w_test
+    idx_val_end = n - w_test
 
-    if feature_means is None:
-        feature_means = [0.0] * (T + 1)
-    else:
-        if len(feature_means) != (T + 1):
-            raise ValueError("feature_means must have length T+1 or be None.")
+    X_train = X[:idx_train_end]
+    y_train = y[:idx_train_end]
 
-    # 2) Generate feature data for sources D_1..D_T
-    x_d1T_list: List[NDArray[np.float64]] = []
-    X_prev: Optional[NDArray[np.float64]] = None
+    X_val = X[idx_train_end:idx_val_end]
+    y_val = y[idx_train_end:idx_val_end]
 
-    for i in range(T):
-        x_i = rng.normal(loc=0.0, scale=eps1[i], size=(ms[i], d)).astype(np.float64)
-        if feature_means[i] != 0.0:
-            x_i += feature_means[i]  # shift entire distribution by feature_means[i]
+    X_test = X[idx_val_end:]
+    y_test = y[idx_val_end:]
 
-        # If beta_mixing => incorporate fraction of previous distribution
-        if beta_mixing and i > 0 and X_prev is not None:
-            x_i = beta_value * X_prev + np.sqrt(1 - beta_value**2) * x_i
-
-        x_d1T_list.append(x_i)
-        X_prev = x_i
-
-    # 3) Generate target train, test, val sets
-    x_trgt_train = rng.normal(loc=0.0, scale=eps1[T], size=(ms[T], d)).astype(
-        np.float64
-    )
-    x_trgt_test = rng.normal(
-        loc=0.0, scale=eps1[T], size=(int(10 * m1T_sum), d)
-    ).astype(np.float64)
-    x_trgt_val = rng.normal(loc=0.0, scale=[T], size=(100, d)).astype(np.float64)
-
-    if feature_means[T] != 0.0:
-        x_trgt_train += feature_means[T]
-        x_trgt_test += feature_means[T]
-        x_trgt_val += feature_means[T]
-
-    # 4) Construct base and target weight vectors
-    w_trgt = rng.normal(loc=weight_loc, scale=1.0, size=(d, 1))
-    w_trgt /= np.linalg.norm(w_trgt)
-
-    w_base = rng.normal(loc=weight_loc, scale=1.0, size=(d, 1))
-    w_base /= np.linalg.norm(w_base)
-
-    ws = [w_trgt]
-    for i in range(T):
-        if random_w:
-            # re-draw base with same loc
-            w_base = rng.normal(loc=weight_loc, scale=1.0, size=(d, 1))
-            w_base /= np.linalg.norm(w_base)
-        w_i = w_trgt + eps2[i] * w_base
-        if normalize_w_t:
-            w_i /= np.linalg.norm(w_i)
-        ws.insert(-1, w_i)
-
-    # 5) Generate labels for D_1..D_T
-    y_d1T_list: List[NDArray[np.float64]] = []
-    for i in range(T):
-        noise_i = rng.normal(loc=noise_loc, scale=sigma, size=(ms[i], 1))
-        y_temp = x_d1T_list[i] @ ws[i] + noise_i
-        y_temp = y_temp.astype(np.float64)
-        y_d1T_list.append(y_temp)
-
-    # 6) Generate labels for D_{T+1}: train, test, val
-    noise_train = rng.normal(loc=noise_loc, scale=sigma, size=(ms[T], 1))
-    y_trgt_train = (x_trgt_train @ ws[T] + noise_train).astype(np.float64)
-
-    noise_test = rng.normal(loc=noise_loc, scale=sigma, size=(10 * m1T_sum, 1))
-    y_trgt_test = (x_trgt_test @ ws[T] + noise_test).astype(np.float64)
-
-    noise_val = rng.normal(loc=noise_loc, scale=sigma, size=(ms[T], 1))
-    y_trgt_val = (x_trgt_val @ ws[T] + noise_val).astype(np.float64)
-
-    # 7) Introduce heavy noise in D_1..D_T from alpha*ms[i] onward
-    for i in range(T):
-        start_idx = int(alpha * ms[i])
-        for j in range(start_idx, ms[i]):
-            y_d1T_list[i][j, 0] = np.linalg.norm(ws[i]) ** 2
-            x_d1T_list[i][j, :] = -100.0 * ws[i].ravel()
-
-    # 8) Flatten the source data
-    x_d1T_train, y_d1T_train = np.vstack(x_d1T_list), np.vstack(y_d1T_list)
-
-    return (
-        x_d1T_train,
-        y_d1T_train,
-        x_trgt_train,
-        y_trgt_train,
-        x_trgt_test,
-        y_trgt_test,
-        x_trgt_val,
-        y_trgt_val,
-        x_d1T_list,
-        y_d1T_list,
-    )
+    return X_train, y_train, X_val, y_val, X_test, y_test
