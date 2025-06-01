@@ -1,146 +1,141 @@
-from typing import List, Sequence
-
 import numpy as np
-from numpy.typing import NDArray
+import scipy.linalg as la
 
 
-def compute_disc(
-    xs: NDArray[np.float64],
-    ys: NDArray[np.float64],
-    xt: NDArray[np.float64],
-    yt: NDArray[np.float64],
-    rng: np.random.Generator,
-    outer_iters: int = 100,
-    inner_iters: int = 1000,
-    tol: float = 1e-5,
-    lr: float = 0.1,
-) -> float:
-    """Compute a discrepancy measure.
+class DiscrepancyEstimator:
+    """Compute per-sample discrepancies d_i = sup_{w:||w||<=1} |a(w) - l_i(w)|.
 
-    Compute discrepency measure between source domain (xs, ys) a target domain (xt, yt)
-    via difference-of-convex (DC) programming.
-
-    This function attempts to find a linear mapping that maximizes the
-    difference between the mean-squared error on the source data and that on the
-    target data, thus serving as an approximate discrepancy measure.
-
-    Args:
-        xs (NDArray[np.float_]): Source features of shape (m, d).
-        ys (NDArray[np.float_]): Source labels of shape (m, 1).
-        xt (NDArray[np.float_]): Target features of shape (n, d).
-        yt (NDArray[np.float_]): Target labels of shape (n, 1).
-        rng (np.random.Generator): Numpy random number generator.
-        outer_iters (int): Number of outer iterations for DC programming.
-        inner_iters (int): Number of gradient steps in each outer iteration.
-        tol (float): Tolerance for improvement in objective value.
-        lr (float): Learning rate for the inner gradient steps.
-
-    Returns:
-        float: The computed discrepancy estimate between source and target.
+    Provides two computation modes:
+      - TRS (exact via trust-region eigenvalues)
+      - DCP (approximate via Convex–Concave Procedure)
     """
-    m = xs.shape[0]
-    n = xt.shape[0]
-    d = xs.shape[1]
 
-    # Randomly initialize a weight vector w with norm 1
-    w = rng.normal(size=(d, 1))
-    w /= np.linalg.norm(w)
+    def __init__(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        p: np.ndarray,
+        trs_plus_only: bool = False,
+    ):
+        """Initialize estimator with data and prior weights.
 
-    outer_obj_val = np.inf
-    loss_values: List[float] = []
+        Args:
+            X (np.ndarray): Feature matrix of shape (n, d).
+            y (np.ndarray): Target vector of shape (n,).
+            p (np.ndarray): Prior weights of shape (n,), summing to 1.
+            trs_plus_only (bool):
+                If True, in the TRS method only return the largest eigenvalue
+                of A_s - x_i x_i^T (S_plus) instead of max(S_plus, S_minus).
+        """
+        self.X = X
+        self.y = y
+        self.p = p
+        self.n, self.d = X.shape
+        self.A_s = X.T @ (p[:, None] * X)
+        self.b_s = X.T @ (p * y)
+        self.trs_plus_only = trs_plus_only
 
-    for _ in range(outer_iters):
-        w0 = w
-        w = rng.normal(size=(d, 1))
+    def di_trs(self, i: int) -> float:
+        """Compute d_i exactly via trust-region eigenvalue solver.
+
+        Args:
+            i (int): Index of the sample.
+
+        Returns:
+            float: Exact discrepancy d_i.
+        """
+        xi = self.X[i : i + 1]  # 1×d
+        yi = self.y[i]
+
+        M = self.A_s - xi.T @ xi  # d×d
+        c = (-2 * self.b_s) + 2 * yi * xi.flatten()  # length-d
+
+        top = np.hstack([M, (c / 2)[:, None]])
+        bottom = np.hstack([(c / 2)[None, :], np.zeros((1, 1))])
+        K = np.vstack([top, bottom])
+
+        ev = la.eigvalsh(K)
+        λ_plus = ev[-1]  # sup    f(w)
+        if self.trs_plus_only:
+            return float(λ_plus)
+        λ_minus = -ev[0]  # sup -f(w)  = - inf f(w)
+        return float(max(λ_plus, λ_minus))
+
+    def all_di_trs(self) -> np.ndarray:
+        """Compute all d_i via exact TRS method.
+
+        Returns:
+            np.ndarray: Array of shape (n,) of d_i values.
+        """
+        return np.array([self.di_trs(i) for i in range(self.n)])
+
+    def all_di_dcp(
+        self,
+        outer_iters: int = 20,
+        inner_iters: int = 100,
+        lr: float = 0.1,
+        tol: float = 1e-6,
+    ) -> np.ndarray:
+        """Compute all d_i via DCP approximation.
+
+        Args:
+            outer_iters (int): DCP outer iterations.
+            inner_iters (int): Gradient steps per surrogate.
+            lr (float): Learning rate for inner ascent.
+            tol (float): Convergence tolerance.
+
+        Returns:
+            np.ndarray: Array of shape (n,) of d_i values.
+        """
+        return np.array(
+            [
+                self.di_dcp(
+                    i, outer_iters=outer_iters, inner_iters=inner_iters, lr=lr, tol=tol
+                )
+                for i in range(self.n)
+            ]
+        )
+
+    def di_dcp(
+        self,
+        i: int,
+        outer_iters: int = 20,
+        inner_iters: int = 100,
+        lr: float = 0.1,
+        tol: float = 1e-6,
+    ) -> float:
+        """Approximate d_i via DC programming (Convex–Concave Procedure).
+
+        Args:
+            i (int): Index of the sample.
+            outer_iters (int): DCP outer iterations.
+            inner_iters (int): Gradient steps per surrogate.
+            lr (float): Learning rate for inner ascent.
+            tol (float): Convergence tolerance.
+
+        Returns:
+            float: Approximated discrepancy d_i.
+        """
+        xi = self.X[i : i + 1]
+        yi = self.y[i]
+        # Initialize w on unit sphere
+        w = np.random.default_rng(0).normal(size=(self.d, 1))
         w /= np.linalg.norm(w)
 
-        ypred_s = xs @ w0
-        ypred_t = xt @ w0
+        def g_grad(w):
+            return 2 * self.A_s @ w
 
-        curr_obj_val = (
-            np.linalg.norm(ypred_s - ys) ** 2 / m
-            - np.linalg.norm(ypred_t - yt) ** 2 / n
-        )
-        loss_values.append(curr_obj_val)
+        def h_grad(w):
+            return 2 * xi.T @ (xi @ w - yi)
 
-        if abs(curr_obj_val - outer_obj_val) <= tol:
-            return curr_obj_val
-        outer_obj_val = curr_obj_val
-
-        # Inner optimization for w
-        inner_obj_val = np.inf
-        for _ in range(inner_iters):
-            residual_s = (xs @ w - ys).squeeze()
-            M_s = np.matmul(np.diag(residual_s), xs)
-            grad_s = np.sum(M_s, axis=0) / m
-            grad_s = grad_s.reshape(-1, 1)
-
-            residual_t = (xt @ w0 - yt).squeeze()
-            M_t = np.matmul(np.diag(residual_t), xt)
-            grad_t = np.sum(M_t, axis=0) / n
-            grad_t = grad_t.reshape(-1, 1)
-
-            grad = grad_s - grad_t
-            w -= lr * grad
-
-            # Project w back to unit norm if needed
-            norm_w = np.linalg.norm(w)
-            if norm_w > 1:
-                w /= norm_w
-
-            # Evaluate new objective
-            ypred_s_new = xs @ w
-            ypred_t_old = xt @ w0
-            ypred_t_new = xt @ w
-
-            curr_inner_val = (
-                0.5 * np.linalg.norm(ypred_s_new - ys) ** 2 / m
-                - np.sum(ypred_t_old * ypred_t_new) / n
-            )
-            if abs(curr_inner_val - inner_obj_val) <= tol:
+        prev_phi = -np.inf
+        for _ in range(outer_iters):
+            grad_hi = h_grad(w)
+            for _ in range(inner_iters):
+                w += lr * (g_grad(w) - grad_hi)
+                w /= max(1.0, np.linalg.norm(w))
+            phi = float((w.T @ self.A_s @ w) - ((xi @ w - yi) ** 2))
+            if abs(phi - prev_phi) < tol:
                 break
-            inner_obj_val = curr_inner_val
-
-    return -outer_obj_val
-
-
-def get_dbars(
-    xs: NDArray[np.float64],
-    ys: NDArray[np.float64],
-    xt: NDArray[np.float64],
-    yt: NDArray[np.float64],
-    ms: Sequence[int],
-    rng: np.random.Generator,
-) -> List[float]:
-    """Compute discrepancy values.
-
-    Compute discrepancy values between multiple source chunks and single target domain.
-
-    Slices the combined sources (xs, ys) into sub-sources according to the sizes
-    in ms, and for each sub-source, calls compute_disc(...) against the target
-    (xt, yt).
-
-    Args:
-        xs (NDArray[np.float_]): Source features with total shape (M, d),
-            where M is the sum of all source chunk sizes.
-        ys (NDArray[np.float_]): Source labels with total shape (M, 1).
-        xt (NDArray[np.float_]): Target features of shape (N, d).
-        yt (NDArray[np.float_]): Target labels of shape (N, 1).
-        ms (Sequence[int]): Sizes of each source domain chunk, followed by the
-            target size. The last element typically corresponds to the size of
-            the target data.
-        rng (np.random.Generator): Numpy random number generator.
-
-    Returns:
-        List[float]: A list of absolute discrepancy values for each source
-        chunk, compared to the target.
-    """
-    dbars_drift: List[float] = []
-    # len(ms) - 1 because the last item of ms is typically the target chunk
-    for t in range(len(ms) - 1):
-        n_t = int(np.sum(ms[:t]))
-        x_slice = xs[n_t : n_t + ms[t]]
-        y_slice = ys[n_t : n_t + ms[t]]
-        t_disc = compute_disc(xs=x_slice, ys=y_slice, xt=xt, yt=yt, rng=rng)
-        dbars_drift.append(abs(t_disc))
-    return dbars_drift
+            prev_phi = phi
+        return abs(prev_phi)
