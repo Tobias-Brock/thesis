@@ -532,13 +532,13 @@ class ExperimentRunner:
 
         p0_abs = single_abs.tuner._build_prior(n_source, prior_len_abs)
         d_abs = DiscrepancyEstimator(
-            X=X_source, y=y_source, p=p0_abs, trs_plus_only=True
+            X=X_source, y=y_source, p=p0_abs, trs_plus_only=False
         ).all_di_trs()[:n_source]
         q_abs = single_abs.q_full[:n_source]
 
         p0 = single.tuner._build_prior(n_source, prior_len)
         d = DiscrepancyEstimator(
-            X=X_source, y=y_source, p=p0, trs_plus_only=False
+            X=X_source, y=y_source, p=p0, trs_plus_only=True
         ).all_di_trs()[:n_source]
         q = single.q_full[:n_source]
 
